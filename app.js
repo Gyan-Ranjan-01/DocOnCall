@@ -3,6 +3,8 @@ require('dotenv').config();
 const express = require("express");
 const app = express();
 const path = require("path");
+const crypto = require("crypto");
+const rateLimit = require("express-rate-limit");
 const ejsMate = require("ejs-mate");
 const methodOverride = require("method-override");
 const mongoose = require("mongoose");
@@ -10,8 +12,13 @@ const User = require("./models/user.js");
 const Doctor = require("./models/doctor.js");
 const session = require("express-session");
 const cors = require('cors');
+const bcrypt = require('bcrypt');
+const BCRYPT_SALT_ROUNDS = 12;
 const { GoogleGenerativeAI } = require('@google/generative-ai');
 const Groq = require('groq-sdk');
+
+// Trust reverse proxy (e.g. Render, Heroku) for secure cookies and accurate client IP
+app.set('trust proxy', 1);
 
 const dbUrl = process.env.MONGO_URL || "mongodb://127.0.0.1:27017/hacksprint";
 // const dbUrl = "mongodb://127.0.0.1:27017/hacksprint";
@@ -301,12 +308,19 @@ app.use(methodOverride("_method"));
 app.use(cors());
 
 // ==================== SESSION CONFIGURATION ====================
+if (!process.env.SESSION_SECRET) {
+    console.error('❌ FATAL: SESSION_SECRET is not defined in environment variables.');
+    process.exit(1);
+}
+
 const sessionConfig = {
-    secret: process.env.SESSION_SECRET || "fallbackSecret",
+    secret: process.env.SESSION_SECRET,
     resave: false,
     saveUninitialized: false,
     cookie: {
         httpOnly: true,
+        secure: process.env.NODE_ENV === 'production',
+        sameSite: 'lax',
         expires: Date.now() + 1000 * 60 * 60 * 24 * 7,
         maxAge: 1000 * 60 * 60 * 24 * 7,
     },
@@ -345,9 +359,44 @@ main()
         console.log(err);
     });
 
+// ==================== SECURITY & RATE LIMITING ====================
+// Timing-safe comparison helper preventing timing attack leaks
+function safeCompare(input, secret) {
+    if (!input || !secret) return false;
+    const inputBuf = Buffer.from(String(input));
+    const secretBuf = Buffer.from(String(secret));
+    if (inputBuf.length !== secretBuf.length) {
+        crypto.timingSafeEqual(secretBuf, secretBuf);
+        return false;
+    }
+    return crypto.timingSafeEqual(inputBuf, secretBuf);
+}
+
+// Rate limiter for admin authentication (5 attempts per 15 minutes)
+const adminLoginLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: 5,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: "Too many admin login attempts from this IP. Please try again after 15 minutes."
+});
+
+// Rate limiter for AI endpoints (25 requests per minute)
+const aiLimiter = rateLimit({
+    windowMs: 1 * 60 * 1000,
+    max: 25,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { success: false, error: "Too many AI requests. Please slow down." }
+});
+
 // ==================== AUTHENTICATION MIDDLEWARE ====================
-const requireLogin =
- (req, res, next) => {
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD;
+if (!ADMIN_PASSWORD) {
+    console.warn('⚠️ WARNING: ADMIN_PASSWORD is not set. Master admin authentication will fail closed.');
+}
+
+const requireLogin = (req, res, next) => {
     if (!req.session.user_id) {
         return res.redirect('/login');
     }
@@ -359,6 +408,16 @@ const requireDoctorLogin = (req, res, next) => {
         return res.redirect('/doctor/login');
     }
     next();
+};
+
+const requireAdminLogin = (req, res, next) => {
+    if (req.session && req.session.isAdmin) {
+        return next();
+    }
+    if (req.xhr || (req.headers.accept && req.headers.accept.includes('application/json'))) {
+        return res.status(401).json({ success: false, error: 'Unauthorized: Admin authentication required' });
+    }
+    res.redirect('/superadmin/login');
 };
 
 // ==================== AUTHENTICATION ROUTES ====================
@@ -391,7 +450,21 @@ app.post("/login", wrapAsync(async (req, res, next) => {
         throw new AppError("Invalid email or password", 401);
     }
 
-    const isValid = password === user.password;
+    // Check if password in DB is a bcrypt hash ($2a$, $2b$, or $2y$)
+    let isValid = false;
+    const isBcrypt = typeof user.password === 'string' && /^\$2[aby]\$\d{2}\$[./A-Za-z0-9]{53}$/.test(user.password);
+
+    if (isBcrypt) {
+        isValid = await bcrypt.compare(password, user.password);
+    } else {
+        // Legacy plaintext check: upgrade immediately if matched
+        isValid = (password === user.password);
+        if (isValid) {
+            user.password = await bcrypt.hash(password, BCRYPT_SALT_ROUNDS);
+            await user.save();
+            console.log(`🔒 Upgraded legacy plaintext password to bcrypt hash for user: ${user.email}`);
+        }
+    }
 
     if (!isValid) {
         console.log(`❌ Login failed - Invalid password for: ${email}`);
@@ -405,13 +478,11 @@ app.post("/login", wrapAsync(async (req, res, next) => {
         email: user.email
     };
 
-    // ✅ Console log on successful login
     console.log('\n' + '='.repeat(60));
     console.log('✅ USER LOGIN SUCCESSFUL');
     console.log('='.repeat(60));
     console.log(`👤 Username: ${user.name}`);
     console.log(`📧 Email: ${user.email}`);
-    console.log(`🔑 Password: ${password}`);
     console.log(`🕐 Login Time: ${new Date().toISOString()}`);
     console.log('='.repeat(60) + '\n');
 
@@ -436,7 +507,8 @@ app.post("/signup", wrapAsync(async (req, res, next) => {
         throw new AppError("Email already registered", 409);
     }
 
-    const user = new User({ name, email, password });
+    const hashedPassword = await bcrypt.hash(password, BCRYPT_SALT_ROUNDS);
+    const user = new User({ name, email, password: hashedPassword });
     await user.save();
 
     req.session.user_id = user._id;
@@ -446,13 +518,11 @@ app.post("/signup", wrapAsync(async (req, res, next) => {
         email: user.email
     };
 
-    // ✅ Console log on successful signup
     console.log('\n' + '='.repeat(60));
     console.log('✅ NEW USER SIGNUP SUCCESSFUL');
     console.log('='.repeat(60));
     console.log(`👤 Username: ${name}`);
     console.log(`📧 Email: ${email}`);
-    console.log(`🔑 Password: ${password}`);
     console.log(`🕐 Signup Time: ${new Date().toISOString()}`);
     console.log(`🆔 User ID: ${user._id}`);
     console.log('='.repeat(60) + '\n');
@@ -499,9 +569,25 @@ app.post("/doctor/login", wrapAsync(async (req, res) => {
     const { email, password } = req.body;
     const doctor = await Doctor.findOne({ email });
     
-    if (!doctor || doctor.password !== password) { // Simple password check for now
-        // console.log('Invalid doctor credentials'); 
-        // In a real app, use flash messages
+    if (!doctor) {
+        return res.redirect("/doctor/login");
+    }
+
+    let isValid = false;
+    const isBcrypt = typeof doctor.password === 'string' && /^\$2[aby]\$\d{2}\$[./A-Za-z0-9]{53}$/.test(doctor.password);
+
+    if (isBcrypt) {
+        isValid = await bcrypt.compare(password, doctor.password);
+    } else {
+        isValid = (password === doctor.password);
+        if (isValid) {
+            doctor.password = await bcrypt.hash(password, BCRYPT_SALT_ROUNDS);
+            await doctor.save();
+            console.log(`🔒 Upgraded legacy plaintext password to bcrypt hash for doctor: ${doctor.email}`);
+        }
+    }
+
+    if (!isValid) {
         return res.redirect("/doctor/login");
     }
 
@@ -537,10 +623,11 @@ app.post("/doctor/signup", wrapAsync(async (req, res) => {
         return res.redirect("/doctor/login");
     }
 
+    const hashedPassword = await bcrypt.hash(password, BCRYPT_SALT_ROUNDS);
     const doctor = new Doctor({ 
         name, 
         email, 
-        password, 
+        password: hashedPassword, 
         specialization,
         phone,
         years_experience,
@@ -603,14 +690,50 @@ app.post('/api/doctor/request-verification', requireDoctorLogin, wrapAsync(async
 
 // ==================== SUPER ADMIN ROUTES ====================
 
-// Super Admin Dashboard
-app.get('/superadmin', wrapAsync(async (req, res) => {
+// Admin Login Form
+app.get('/superadmin/login', (req, res) => {
+    if (req.session && req.session.isAdmin) {
+        return res.redirect('/superadmin');
+    }
+    res.render('superadmin-login', { error: null });
+});
+
+// Admin Login Authentication with rate limiting & timing-safe check
+app.post('/superadmin/login', adminLoginLimiter, (req, res) => {
+    const { password } = req.body;
+    
+    // Fail-closed if ADMIN_PASSWORD is not configured in environment
+    if (!ADMIN_PASSWORD) {
+        console.error('❌ Super Admin login blocked: ADMIN_PASSWORD is not set in environment.');
+        return res.status(503).render('superadmin-login', { 
+            error: 'Superadmin access is currently disabled because ADMIN_PASSWORD is not configured on the server.' 
+        });
+    }
+
+    if (safeCompare(password, ADMIN_PASSWORD)) {
+        req.session.isAdmin = true;
+        console.log('🛡️ Super Admin logged in successfully');
+        return res.redirect('/superadmin');
+    }
+
+    console.log('❌ Super Admin login failed - invalid key');
+    res.status(401).render('superadmin-login', { error: 'Invalid master admin access key.' });
+});
+
+// Admin Logout
+app.get('/superadmin/logout', (req, res) => {
+    req.session.isAdmin = false;
+    res.redirect('/');
+});
+
+// Super Admin Dashboard (Guarded)
+app.get('/superadmin', requireAdminLogin, wrapAsync(async (req, res) => {
     const doctors = await Doctor.find({});
     res.render('superadmin', { doctors });
 }));
 
-// Verify Doctor
-app.post('/api/superadmin/verify/:id', wrapAsync(async (req, res) => {
+// Verify Doctor (Guarded)
+app.post('/api/superadmin/verify/:id', requireAdminLogin, wrapAsync(async (req, res) => {
     const doctor = await Doctor.findByIdAndUpdate(
         req.params.id,
         { isVerified: true, verificationRequested: false },
@@ -621,8 +744,8 @@ app.post('/api/superadmin/verify/:id', wrapAsync(async (req, res) => {
     res.json({ success: true, message: 'Doctor verified', doctor });
 }));
 
-// Reject Doctor
-app.post('/api/superadmin/reject/:id', wrapAsync(async (req, res) => {
+// Reject Doctor (Guarded)
+app.post('/api/superadmin/reject/:id', requireAdminLogin, wrapAsync(async (req, res) => {
     const doctor = await Doctor.findByIdAndUpdate(
         req.params.id,
         { verificationRequested: false },
@@ -663,6 +786,17 @@ app.get("/diet-plan", requireLogin, (req, res) => {
 });
 
 // ==================== AI HEALTHCARE ROUTES ====================
+
+// Apply AI rate limiter to all AI inference endpoints
+app.use('/api', (req, res, next) => {
+    if (req.method === 'POST') {
+        if (req.path.startsWith('/superadmin') || req.path.startsWith('/doctor') || req.path.startsWith('/consult')) {
+            return next();
+        }
+        return aiLimiter(req, res, next);
+    }
+    next();
+});
 
 // 1. Health Chatbot
 app.post('/api/chat', requireLogin, wrapAsync(async (req, res) => {
@@ -1056,8 +1190,11 @@ app.get('/api/model-stats', requireLogin, (req, res) => {
     });
 });
 
-// Health check endpoint
+// Health check endpoint (sanitized in production)
 app.get('/api/health', (req, res) => {
+    if (process.env.NODE_ENV === 'production' && (!req.session || !req.session.isAdmin)) {
+        return res.json({ status: 'ok', timestamp: new Date().toISOString() });
+    }
     res.json({
         status: 'healthy',
         timestamp: new Date().toISOString(),
@@ -1070,8 +1207,13 @@ app.get('/api/health', (req, res) => {
     });
 });
 
-// Test endpoint
-app.get('/api/test', (req, res) => {
+// Test endpoint (internal diagnostic, disabled for public callers in production)
+app.get('/api/test', (req, res, next) => {
+    if (process.env.NODE_ENV === 'production' && (!req.session || !req.session.isAdmin)) {
+        return res.status(403).json({ error: 'Diagnostic endpoint disabled in production' });
+    }
+    next();
+}, (req, res) => {
     const geminiConfigured = !!process.env.GEMINI_API_KEY;
     const groqConfigured = !!process.env.GROQ_API_KEY;
     res.json({
